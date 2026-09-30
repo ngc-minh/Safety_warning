@@ -12,6 +12,12 @@ Bản viết lại của src/main.py. Khác biệt chính:
   5. Topic + payload theo đúng PLAN.md      -> backend FastAPI subscribe được.
   6. Ba chế độ xem: cửa sổ / stream HTTP / không hiển thị.
   7. Nguồn vào: camera, file video hoặc ảnh -> vẫn dev được khi camera hỏng.
+  8. Gộp box người bị trùng (dedupe_persons)    -> vật cản che thân dưới có
+     thể khiến model xuất 2 box (nửa người + cả người) cho CÙNG một người,
+     bị ByteTrack coi là 2 Worker khác nhau nếu không gộp trước khi ghép PPE.
+  9. Debounce chống nhiễu 2 chiều (violation.py) -> bản cũ reset hết vi phạm
+     ngay khi gặp 1 frame an toàn; một vi phạm liên tục có thể không bao giờ
+     đủ 5 giây nếu model thỉnh thoảng nhận nhầm 1-2 frame là có đủ đồ.
 
 Ví dụ:
     python src/detect.py                            # camera 0, hiện cửa sổ (cần VNC)
@@ -48,6 +54,11 @@ BODY_BAND = (0.20, 0.80)
 
 WORKER_TTL = 3.0        # giây: quá lâu không thấy thì xoá, tránh ghép nhầm người mới
 MATCH_DIST = 120        # px: bán kính ghép lại khi ByteTrack mất ID
+
+# Nếu 1 box người nằm gọn (>= tỉ lệ này) bên trong 1 box người khác thì coi
+# là YOLO xuất trùng cho cùng một người thật (thường do vật cản che thân
+# dưới), không phải 2 người khác nhau -> giữ lại box có confidence cao hơn.
+PERSON_DEDUPE_CONTAINMENT = 0.85
 
 COLORS = {"SAFE": (0, 255, 0), "WARNING": (0, 165, 255), "VIOLATION": (0, 0, 255)}
 
@@ -117,6 +128,70 @@ def match_gear(persons, gear, band):
         taken_gear.add(gi)
         result[pi] = gi
     return result
+
+
+def _containment(box_a, box_b):
+    """Tỉ lệ diện tích box NHỎ HƠN nằm bên trong box còn lại.
+
+    Khác IoU thường dùng cho NMS: hai người đứng cạnh nhau, mỗi box lệch
+    hẳn một phía, vẫn có thể có IoU cao nhưng containment thấp. Ngược lại
+    một box "nửa người" lồng gần trọn trong box "cả người" (cùng track bị
+    vật cản che chân) có containment rất cao dù IoU không cực đại do lệch
+    tỉ lệ khung hình.
+    """
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    smaller = min(area_a, area_b)
+
+    return inter / smaller if smaller else 0.0
+
+
+def dedupe_persons(persons, containment_thresh=PERSON_DEDUPE_CONTAINMENT):
+    """Gộp các box người mà YOLO xuất trùng cho CÙNG một người thật.
+
+    Thường gặp khi vật cản (khung sắt, bàn...) che một phần thân người: model
+    xuất thêm một box "nửa người" lồng gần như trọn vẹn trong box "cả người"
+    mà NMS mặc định không gộp được (khác tỉ lệ khung hình nên IoU không đủ
+    cao). Không gộp trước khi ghép PPE/tracking thì 1 người thật bị đếm và
+    theo dõi thành 2 Worker khác nhau — bằng chứng: AI/test.mp4 frame 290,
+    2 box (866,197,1115,609) và (870,189,1116,897) của cùng một công nhân
+    bị tách thành Worker #3 và #7 suốt ~2.8 giây.
+
+    Giữa cặp box trùng, giữ lại box có confidence cao hơn (nếu có), hoặc box
+    lớn hơn (nhiều khả năng là box "cả người", đủ để ghép cả mũ lẫn áo).
+    """
+    removed = set()
+
+    for i in range(len(persons)):
+        if i in removed:
+            continue
+        for j in range(i + 1, len(persons)):
+            if j in removed:
+                continue
+
+            if _containment(persons[i]["bbox"], persons[j]["bbox"]) < containment_thresh:
+                continue
+
+            conf_i = persons[i].get("conf")
+            conf_j = persons[j].get("conf")
+
+            if conf_i is not None and conf_j is not None and conf_i != conf_j:
+                loser = i if conf_i < conf_j else j
+            else:
+                area = lambda p: ((p["bbox"][2] - p["bbox"][0])
+                                   * (p["bbox"][3] - p["bbox"][1]))
+                loser = i if area(persons[i]) < area(persons[j]) else j
+
+            removed.add(loser)
+
+    return [p for k, p in enumerate(persons) if k not in removed]
 
 
 # ---------------------------------------------------------------- worker ID
@@ -361,6 +436,9 @@ def parse_args():
     p.add_argument("--view", choices=["window", "stream", "none"], default="window")
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--violation-seconds", type=float, default=5.0)
+    p.add_argument("--safe-grace-seconds", type=float, default=1.0,
+                   help="phai an toan LIEN TUC bao lau moi tinh la het vi pham "
+                        "(chong nhieu: model nhan nham 1-2 frame khong reset duoc dem)")
     p.add_argument("--mqtt", action="store_true", help="bat gui MQTT")
     p.add_argument("--broker", default="localhost")
     p.add_argument("--broker-port", type=int, default=1883)
@@ -399,7 +477,8 @@ def main():
             "    3. Kiem chung: v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=5\n"
             "  Trong luc cho, van dev duoc: --source demo.mp4")
 
-    tracker = ViolationTracker(violation_seconds=args.violation_seconds)
+    tracker = ViolationTracker(violation_seconds=args.violation_seconds,
+                               safe_grace_seconds=args.safe_grace_seconds)
     registry = WorkerRegistry()
     pub = (Publisher(args.broker, args.broker_port, args.device_id,
                      args.mqtt_user, args.mqtt_pass) if args.mqtt else None)
@@ -457,11 +536,16 @@ def main():
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 if cls == CLS_PERSON:
                     tid = int(box.id[0]) if box.id is not None else None
-                    persons.append({"bbox": (x1, y1, x2, y2), "track_id": tid})
+                    conf = float(box.conf[0])
+                    persons.append({"bbox": (x1, y1, x2, y2), "track_id": tid, "conf": conf})
                 elif cls == CLS_HELMET:
                     helmets.append((x1, y1, x2, y2))
                 elif cls == CLS_VEST:
                     vests.append((x1, y1, x2, y2))
+
+            # Gộp box người bị YOLO xuất trùng cho cùng 1 người TRƯỚC khi
+            # ghép PPE/tracking, không thì mỗi bản sao thành 1 Worker riêng.
+            persons = dedupe_persons(persons)
 
             helmet_of = match_gear(persons, helmets, HEAD_BAND)
             vest_of = match_gear(persons, vests, BODY_BAND)
